@@ -91,7 +91,9 @@ pub use crate::__temporal_join as join;
 
 use crate::{
     BaseWorkflowContext, SyncWorkflowContext, WorkflowContext, WorkflowContextView,
-    WorkflowTermination, workflow_executor::SdkGuardedFuture,
+    WorkflowTermination,
+    interceptors::{ExecuteInput, WorkflowExecuteOutput},
+    workflow_executor::SdkGuardedFuture,
 };
 use futures_util::future::{Fuse, FutureExt, LocalBoxFuture};
 use std::{
@@ -466,10 +468,11 @@ where
         base_ctx: BaseWorkflowContext,
         init_input: Option<<W::Run as WorkflowDefinition>::Input>,
         run_input: Option<<W::Run as WorkflowDefinition>::Input>,
+        execute_args: Vec<Payload>,
     ) -> Self {
         let view = base_ctx.view();
         let workflow = W::init(view, init_input);
-        Self::new_with_workflow(workflow, base_ctx, run_input)
+        Self::new_with_workflow(workflow, base_ctx, run_input, execute_args)
     }
 
     /// Create a new workflow execution from an already-created workflow instance.
@@ -477,10 +480,24 @@ where
         workflow: W,
         base_ctx: BaseWorkflowContext,
         run_input: Option<<W::Run as WorkflowDefinition>::Input>,
+        execute_args: Vec<Payload>,
     ) -> Self {
         let workflow = Rc::new(RefCell::new(workflow));
         let ctx = WorkflowContext::from_base(base_ctx, workflow);
-        let run_future = W::run(ctx.clone(), run_input).fuse();
+        let base = ctx.base();
+        let input = ExecuteInput::new(
+            W::name().to_string(),
+            execute_args,
+            base.initial_headers(),
+            base.workflow_interceptor_context(base.is_replaying()),
+        );
+        let run_ctx = ctx.clone();
+        let run_future = base
+            .workflow_interceptors()
+            .execute(input, move |_| {
+                W::run(run_ctx.clone(), run_input) as WorkflowExecuteOutput
+            })
+            .fuse();
 
         Self { ctx, run_future }
     }
@@ -571,6 +588,7 @@ impl WorkflowDefinitions {
         let workflow_name = W::name();
         let factory: WorkflowExecutionFactory =
             Arc::new(move |payloads, converter: PayloadConverter, base_ctx| {
+                let execute_args = payloads.clone();
                 let ser_ctx = SerializationContext {
                     data: &SerializationContextData::Workflow,
                     converter: &converter,
@@ -581,10 +599,12 @@ impl WorkflowDefinitions {
                 } else {
                     (None, Some(input))
                 };
-                Ok(
-                    Box::new(WorkflowExecution::<W>::new(base_ctx, init_input, run_input))
-                        as Box<dyn DynWorkflowExecution>,
-                )
+                Ok(Box::new(WorkflowExecution::<W>::new(
+                    base_ctx,
+                    init_input,
+                    run_input,
+                    execute_args,
+                )) as Box<dyn DynWorkflowExecution>)
             });
         self.workflows.insert(workflow_name, factory);
         self
@@ -607,6 +627,7 @@ impl WorkflowDefinitions {
         let user_factory = Arc::new(user_factory);
         let factory: WorkflowExecutionFactory =
             Arc::new(move |payloads, converter: PayloadConverter, base_ctx| {
+                let execute_args = payloads.clone();
                 let ser_ctx = SerializationContext {
                     data: &SerializationContextData::Workflow,
                     converter: &converter,
@@ -620,6 +641,7 @@ impl WorkflowDefinitions {
                     workflow,
                     base_ctx,
                     Some(input),
+                    execute_args,
                 )) as Box<dyn DynWorkflowExecution>)
             });
 

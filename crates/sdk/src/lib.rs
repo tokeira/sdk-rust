@@ -111,7 +111,7 @@ use crate::{
         ActivityContext, ActivityDefinitions, ActivityError, ActivityImplementer,
         ExecutableActivity,
     },
-    interceptors::WorkerInterceptor,
+    interceptors::{WorkerInterceptor, WorkflowInterceptor},
     workflow_context::{
         ChildWfCommon, NexusUnblockData, PendingChildWorkflow, StartedNexusOperation,
     },
@@ -191,6 +191,9 @@ pub struct WorkerOptions {
 
     #[builder(field)]
     workflows: WorkflowDefinitions,
+
+    #[builder(field)]
+    workflow_interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
 
     /// Set the deployment options for this worker. Defaults to a hash of the currently running
     /// executable.
@@ -303,6 +306,12 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
         self
     }
 
+    /// Add a workflow interceptor.
+    pub fn workflow_interceptor(mut self, interceptor: impl WorkflowInterceptor) -> Self {
+        self.workflow_interceptors.push(Arc::new(interceptor));
+        self
+    }
+
     /// Register a workflow with a custom factory for instance creation.
     ///
     /// # Warning: Advanced Usage
@@ -383,6 +392,12 @@ impl WorkerOptions {
         self.workflows.clone()
     }
 
+    /// Add a workflow interceptor.
+    pub fn add_workflow_interceptor(&mut self, interceptor: impl WorkflowInterceptor) -> &mut Self {
+        self.workflow_interceptors.push(Arc::new(interceptor));
+        self
+    }
+
     #[doc(hidden)]
     pub fn to_core_options(
         &self,
@@ -442,6 +457,7 @@ struct WorkflowHalf {
     /// Maps run id to cached workflow state
     workflows: RefCell<HashMap<String, WorkflowData>>,
     workflow_definitions: WorkflowDefinitions,
+    workflow_interceptors: Arc<Vec<Arc<dyn WorkflowInterceptor>>>,
     workflow_removed_from_map: Notify,
     detect_nondeterministic_futures: bool,
 }
@@ -471,6 +487,7 @@ impl Worker {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let acts = std::mem::take(&mut options.activities);
         let wfs = std::mem::take(&mut options.workflows);
+        let workflow_interceptors = std::mem::take(&mut options.workflow_interceptors);
         let wc = options
             .to_core_options(client.namespace(), client.identity())
             .map_err(|s| anyhow::anyhow!("{s}"))?;
@@ -484,6 +501,7 @@ impl Worker {
         me.set_detect_nondeterministic_futures(options.detect_nondeterministic_futures);
         me.activity_half.activities = acts;
         me.workflow_half.workflow_definitions = wfs;
+        me.workflow_half.workflow_interceptors = Arc::new(workflow_interceptors);
         Ok(me)
     }
 
@@ -516,6 +534,7 @@ impl Worker {
             workflow_half: WorkflowHalf {
                 workflows: Default::default(),
                 workflow_definitions: workflows,
+                workflow_interceptors: Default::default(),
                 workflow_removed_from_map: Default::default(),
                 detect_nondeterministic_futures: false,
             },
@@ -584,6 +603,12 @@ impl Worker {
         self.workflow_half
             .workflow_definitions
             .register_workflow_run_with_factory::<W, F>(factory);
+        self
+    }
+
+    /// Add a workflow interceptor.
+    pub fn add_workflow_interceptor(&mut self, interceptor: impl WorkflowInterceptor) -> &mut Self {
+        Arc::make_mut(&mut self.workflow_half.workflow_interceptors).push(Arc::new(interceptor));
         self
     }
 
@@ -815,6 +840,8 @@ impl WorkflowHalf {
                         completions_tx.clone(),
                         payload_converter,
                         self.detect_nondeterministic_futures,
+                        self.workflow_interceptors.clone(),
+                        activation.is_replaying,
                     ) {
                         Ok(result) => result,
                         Err(e) => {

@@ -1,6 +1,10 @@
 use crate::{
     BaseWorkflowContext, CancellableID, RustWfCmd, TimerResult, UnblockEvent, WorkflowResult,
-    WorkflowTermination, panic_formatter,
+    WorkflowTermination,
+    interceptors::{
+        HandleQueryInput, HandleSignalInput, WorkflowInterceptor, WorkflowInterceptorInstance,
+    },
+    panic_formatter,
     workflow_executor::{SdkWakeGuard, WakeTracker},
     workflows::{DispatchData, DynWorkflowExecution, WorkflowExecutionFactory},
 };
@@ -12,7 +16,7 @@ use std::{
     panic,
     panic::AssertUnwindSafe,
     pin::Pin,
-    sync::mpsc::Receiver,
+    sync::{Arc, mpsc::Receiver},
     task::{Context, Poll},
 };
 use temporalio_common::{
@@ -71,6 +75,8 @@ impl WorkflowFunction {
         outgoing_completions: UnboundedSender<WorkflowActivationCompletion>,
         payload_converter: PayloadConverter,
         detect_nondeterministic: bool,
+        workflow_interceptors: Arc<Vec<Arc<dyn WorkflowInterceptor>>>,
+        initial_is_replaying: bool,
     ) -> Result<
         (
             impl Future<Output = WorkflowResult<Payload>> + use<>,
@@ -94,6 +100,12 @@ impl WorkflowFunction {
             cancel_rx,
             payload_converter.clone(),
         );
+        base_ctx.set_is_replaying(initial_is_replaying);
+        let interceptor_ctx = base_ctx.workflow_interceptor_context(initial_is_replaying);
+        base_ctx.set_workflow_interceptors(WorkflowInterceptorInstance::new(
+            workflow_interceptors.as_ref(),
+            interceptor_ctx,
+        ));
 
         // Create the workflow execution using the factory
         let execution = (self.factory)(input, payload_converter.clone(), base_ctx.clone())
@@ -257,13 +269,6 @@ impl WorkflowFuture {
                     debug!(query_type = %q.query_type, "Query received");
                     let query_type = q.query_type;
                     let query_id = q.query_id;
-                    let data = DispatchData {
-                        payloads: Payloads {
-                            payloads: q.arguments,
-                        },
-                        headers: q.headers,
-                        converter: &self.payload_converter,
-                    };
 
                     let dispatch_result = if query_type == "__temporal_workflow_metadata" {
                         // Mirror the proto JSON shape of temporal.api.sdk.v1.WorkflowMetadata.
@@ -289,10 +294,31 @@ impl WorkflowFuture {
                         );
                         Some(Ok(payload?))
                     } else {
+                        let input = HandleQueryInput::new(
+                            query_type.clone(),
+                            q.arguments,
+                            q.headers,
+                            self.base_ctx.workflow_interceptor_context(false),
+                        );
+                        let interceptors = self.base_ctx.workflow_interceptors();
+                        let execution = &self.execution;
+                        let payload_converter = &self.payload_converter;
                         match panic::catch_unwind(AssertUnwindSafe(|| {
-                            self.execution.dispatch_query(&query_type, data)
+                            interceptors.handle_query(input, |input| {
+                                let (query_type, payloads, headers) = input.into_parts();
+                                let data = DispatchData {
+                                    payloads,
+                                    headers,
+                                    converter: payload_converter,
+                                };
+                                execution
+                                    .dispatch_query(&query_type, data)
+                                    .unwrap_or_else(|| {
+                                        Err(anyhow!("No query handler for '{}'", query_type).into())
+                                    })
+                            })
                         })) {
-                            Ok(r) => r,
+                            Ok(r) => Some(r),
                             Err(e) => Some(Err(anyhow!(
                                 "Panic in query handler: {}",
                                 panic_formatter(e)
@@ -305,11 +331,7 @@ impl WorkflowFuture {
                         Some(Ok(payload)) => query_result::Variant::Succeeded(QuerySuccess {
                             response: Some(payload),
                         }),
-                        // TODO [rust-sdk-branch]: Return list of known queries in error
-                        None => query_result::Variant::Failed(Failure {
-                            message: format!("No query handler for '{}'", query_type),
-                            ..Default::default()
-                        }),
+                        None => unreachable!("query dispatch always returns a result"),
                         Some(Err(e)) => query_result::Variant::Failed(Failure {
                             message: e.to_string(),
                             ..Default::default()
@@ -334,18 +356,32 @@ impl WorkflowFuture {
                 }
                 Variant::SignalWorkflow(sig) => {
                     debug!(signal_name = %sig.signal_name, "Signal received");
-                    let data = DispatchData {
-                        payloads: Payloads {
-                            payloads: sig.input,
-                        },
-                        headers: sig.headers,
-                        converter: &self.payload_converter,
-                    };
+                    let signal_name = sig.signal_name;
+                    let input = HandleSignalInput::new(
+                        signal_name.clone(),
+                        sig.input,
+                        sig.headers,
+                        self.base_ctx
+                            .workflow_interceptor_context(self.base_ctx.is_replaying()),
+                    );
+                    let interceptors = self.base_ctx.workflow_interceptors();
+                    let execution = &mut self.execution;
+                    let payload_converter = &self.payload_converter;
 
                     let dispatch_result = match panic::catch_unwind(AssertUnwindSafe(|| {
-                        self.execution.dispatch_signal(&sig.signal_name, data)
+                        interceptors.handle_signal(input, |input| {
+                            let (signal_name, payloads, headers) = input.into_parts();
+                            let data = DispatchData {
+                                payloads,
+                                headers,
+                                converter: payload_converter,
+                            };
+                            execution
+                                .dispatch_signal(&signal_name, data)
+                                .unwrap_or_else(|| async move { Ok(()) }.boxed_local())
+                        })
                     })) {
-                        Ok(r) => r,
+                        Ok(r) => Some(r),
                         Err(e) => {
                             bail!("Panic in signal handler: {}", panic_formatter(e));
                         }

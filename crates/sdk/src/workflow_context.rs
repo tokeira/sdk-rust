@@ -10,7 +10,12 @@ use crate::{
     CancelExternalWfResult, CancellableID, CancellableIDWithReason, CommandCreateRequest,
     CommandSubscribeChildWorkflowCompletion, NexusStartResult, RustWfCmd, SignalExternalWfResult,
     SupportsCancelReason, TimerResult, UnblockEvent, Unblockable, WorkflowTermination,
-    workflow_context::options::IntoWorkflowCommand, workflow_executor::SdkWakeGuard,
+    interceptors::{
+        BoxedCancellableFuture, SleepInput, SleepOutput, WorkflowInterceptorContext,
+        WorkflowInterceptorInstance, WorkflowOperationContext,
+    },
+    workflow_context::options::IntoWorkflowCommand,
+    workflow_executor::SdkWakeGuard,
 };
 use futures_util::{
     FutureExt,
@@ -99,6 +104,7 @@ struct WorkflowContextInner {
     seq_nums: RefCell<WfCtxProtectedDat>,
     payload_converter: PayloadConverter,
     state_mutated: Cell<bool>,
+    workflow_interceptors: RefCell<WorkflowInterceptorInstance>,
 }
 
 /// Context provided to synchronous signal and update handlers.
@@ -380,10 +386,42 @@ impl BaseWorkflowContext {
                     }),
                     payload_converter,
                     state_mutated: Cell::new(false),
+                    workflow_interceptors: RefCell::new(WorkflowInterceptorInstance::default()),
                 }),
             },
             rx,
         )
+    }
+
+    pub(crate) fn set_workflow_interceptors(&self, interceptors: WorkflowInterceptorInstance) {
+        self.inner.workflow_interceptors.replace(interceptors);
+    }
+
+    pub(crate) fn workflow_interceptors(&self) -> WorkflowInterceptorInstance {
+        self.inner.workflow_interceptors.borrow().clone()
+    }
+
+    pub(crate) fn workflow_interceptor_context(
+        &self,
+        is_replaying_history_events: bool,
+    ) -> WorkflowInterceptorContext {
+        let is_replaying = self.inner.shared.borrow().is_replaying;
+        WorkflowInterceptorContext {
+            workflow: self.view(),
+            operation: WorkflowOperationContext::new(is_replaying, is_replaying_history_events),
+        }
+    }
+
+    pub(crate) fn set_is_replaying(&self, is_replaying: bool) {
+        self.inner.shared.borrow_mut().is_replaying = is_replaying;
+    }
+
+    pub(crate) fn is_replaying(&self) -> bool {
+        self.inner.shared.borrow().is_replaying
+    }
+
+    pub(crate) fn initial_headers(&self) -> HashMap<String, Payload> {
+        self.inner.inital_information.headers.clone()
     }
 
     /// Buffer a command to be sent in the activation reply
@@ -413,11 +451,15 @@ impl BaseWorkflowContext {
     }
 
     /// Request to create a timer
-    pub fn timer<T: Into<TimerOptions>>(
-        &self,
-        opts: T,
-    ) -> impl CancellableFuture<TimerResult> + use<T> {
+    pub fn timer<T: Into<TimerOptions>>(&self, opts: T) -> SleepOutput {
         let opts: TimerOptions = opts.into();
+        let input = SleepInput::new(opts, self.workflow_interceptor_context(self.is_replaying()));
+        let base = self.clone();
+        self.workflow_interceptors()
+            .sleep(input, move |input| base.start_timer(input.into_options()))
+    }
+
+    fn start_timer(&self, opts: TimerOptions) -> SleepOutput {
         let seq = self.inner.seq_nums.borrow_mut().next_timer_seq();
         let (cmd, unblocker) =
             CancellableWFCommandFut::new(CancellableID::Timer(seq), self.clone());
@@ -444,7 +486,7 @@ impl BaseWorkflowContext {
             }
             .into(),
         );
-        cmd
+        BoxedCancellableFuture::new(cmd)
     }
 
     /// Request to run an activity
@@ -1132,6 +1174,10 @@ impl<W> WorkflowContext<W> {
     /// Create a read-only view of this context.
     pub(crate) fn view(&self) -> WorkflowContextView {
         self.sync.view()
+    }
+
+    pub(crate) fn base(&self) -> BaseWorkflowContext {
+        self.sync.base.clone()
     }
 
     /// Access workflow state immutably via closure.
@@ -2153,7 +2199,14 @@ impl StartedNexusOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::interceptors::{
+        Next, SleepInput, SleepOutput, WorkflowInterceptor, WorkflowInterceptorContext,
+        WorkflowInterceptors, WorkflowOutboundInterceptor,
+    };
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
     use temporalio_common::{
         data_converters::{TemporalDeserializable, TemporalSerializable},
         protos::{
@@ -2175,13 +2228,13 @@ mod tests {
         }
     }
 
-    fn test_context() -> WorkflowContext<TestWorkflow> {
+    fn test_context_with_cmd_rx() -> (WorkflowContext<TestWorkflow>, Receiver<RustWfCmd>) {
         let init = InitializeWorkflow {
             workflow_type: TestWorkflow.name().to_string(),
             ..Default::default()
         };
         let (_, cancelled_rx) = watch::channel(None);
-        let (base, _cmd_rx) = BaseWorkflowContext::new(
+        let (base, cmd_rx) = BaseWorkflowContext::new(
             "default".to_string(),
             "orig-task-queue".to_string(),
             "run-id".to_string(),
@@ -2189,7 +2242,75 @@ mod tests {
             cancelled_rx,
             PayloadConverter::default(),
         );
-        WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)))
+        (
+            WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow))),
+            cmd_rx,
+        )
+    }
+
+    fn test_context() -> WorkflowContext<TestWorkflow> {
+        test_context_with_cmd_rx().0
+    }
+
+    struct RecordingSleepInterceptor {
+        seen_context: Arc<Mutex<Option<WorkflowInterceptorContext>>>,
+    }
+
+    impl WorkflowInterceptor for RecordingSleepInterceptor {
+        fn intercept_workflow(&self, _ctx: WorkflowInterceptorContext) -> WorkflowInterceptors {
+            let mut interceptors = WorkflowInterceptors::default();
+            interceptors.outbound = Box::new(RecordingSleepOutboundInterceptor {
+                seen_context: self.seen_context.clone(),
+            });
+            interceptors
+        }
+    }
+
+    struct RecordingSleepOutboundInterceptor {
+        seen_context: Arc<Mutex<Option<WorkflowInterceptorContext>>>,
+    }
+
+    impl WorkflowOutboundInterceptor for RecordingSleepOutboundInterceptor {
+        fn sleep<'a>(
+            &'a self,
+            input: SleepInput,
+            next: Next<'a, SleepInput, SleepOutput>,
+        ) -> SleepOutput {
+            self.seen_context
+                .lock()
+                .unwrap()
+                .replace(input.context().clone());
+            next.run(input)
+        }
+    }
+
+    #[test]
+    fn sleep_interceptor_context_exposes_raw_and_refined_replay_state() {
+        let (ctx, _cmd_rx) = test_context_with_cmd_rx();
+        let base = ctx.base();
+        base.set_is_replaying(true);
+        let seen_context = Arc::new(Mutex::new(None));
+        let interceptors = [Arc::new(RecordingSleepInterceptor {
+            seen_context: seen_context.clone(),
+        }) as Arc<dyn WorkflowInterceptor>];
+        base.set_workflow_interceptors(crate::interceptors::WorkflowInterceptorInstance::new(
+            &interceptors,
+            base.workflow_interceptor_context(true),
+        ));
+
+        let _timer = ctx.timer(Duration::from_secs(1));
+
+        let context = seen_context
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("sleep interceptor should observe context");
+        assert!(context.operation.is_replaying);
+        assert!(context.operation.is_replaying_history_events);
+
+        let query_like_context = base.workflow_interceptor_context(false);
+        assert!(query_like_context.operation.is_replaying);
+        assert!(!query_like_context.operation.is_replaying_history_events);
     }
 
     #[test]
