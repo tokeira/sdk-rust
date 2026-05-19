@@ -92,7 +92,7 @@ pub use crate::__temporal_join as join;
 use crate::{
     BaseWorkflowContext, SyncWorkflowContext, WorkflowContext, WorkflowContextView,
     WorkflowTermination,
-    interceptors::{ExecuteInput, WorkflowExecuteOutput},
+    interceptors::{ExecuteInput, WorkflowExecuteOutput, WorkflowValue},
     workflow_executor::SdkGuardedFuture,
 };
 use futures_util::future::{Fuse, FutureExt, LocalBoxFuture};
@@ -464,41 +464,108 @@ where
     <W::Run as WorkflowDefinition>::Input: Send,
 {
     /// Create a new workflow execution using the workflow's `init` method.
+    ///
+    /// The two paths differ only in how the terminal of the interceptor chain handles the
+    /// typed args:
+    ///
+    /// - Non-split workflows: `W::init(view, None)` runs synchronously here (it consumes
+    ///   nothing); the chain terminal hands the typed args to `W::run`.
+    /// - Split-init workflows: the chain terminal does both jobs — it hands the typed args
+    ///   to `W::init`, builds the workflow context around the freshly-constructed workflow,
+    ///   and then hands the same context to `W::run` (which takes no args in this shape).
+    ///
+    /// In both cases the interceptor chain runs synchronously inside this function and the
+    /// resulting [`WorkflowContext`] is shared with signal/query/update dispatch.
     pub(crate) fn new(
         base_ctx: BaseWorkflowContext,
-        init_input: Option<<W::Run as WorkflowDefinition>::Input>,
-        run_input: Option<<W::Run as WorkflowDefinition>::Input>,
-        execute_args: Vec<Payload>,
+        init_takes_input: bool,
+        chain_input: <W::Run as WorkflowDefinition>::Input,
     ) -> Self {
-        let view = base_ctx.view();
-        let workflow = W::init(view, init_input);
-        Self::new_with_workflow(workflow, base_ctx, run_input, execute_args)
+        if init_takes_input {
+            let base_ctx_for_terminal = base_ctx.clone();
+            Self::with_interceptors(base_ctx, chain_input, move |typed| {
+                let workflow = W::init(base_ctx_for_terminal.view(), Some(typed));
+                let ctx = WorkflowContext::from_base(
+                    base_ctx_for_terminal,
+                    Rc::new(RefCell::new(workflow)),
+                );
+                let run_future = W::run(ctx.clone(), None);
+                (ctx, run_future)
+            })
+        } else {
+            let workflow = W::init(base_ctx.view(), None);
+            Self::new_with_workflow(workflow, base_ctx, chain_input)
+        }
     }
 
     /// Create a new workflow execution from an already-created workflow instance.
+    ///
+    /// Used for non-split workflows and for the user-factory-built workflow path. The chain
+    /// terminal hands the typed args to `W::run`.
     pub(crate) fn new_with_workflow(
         workflow: W,
         base_ctx: BaseWorkflowContext,
-        run_input: Option<<W::Run as WorkflowDefinition>::Input>,
-        execute_args: Vec<Payload>,
+        run_input: <W::Run as WorkflowDefinition>::Input,
     ) -> Self {
-        let workflow = Rc::new(RefCell::new(workflow));
-        let ctx = WorkflowContext::from_base(base_ctx, workflow);
-        let base = ctx.base();
+        let ctx = WorkflowContext::from_base(base_ctx.clone(), Rc::new(RefCell::new(workflow)));
+        let ctx_for_terminal = ctx.clone();
+        Self::with_interceptors(base_ctx, run_input, move |typed| {
+            let run_future = W::run(ctx_for_terminal.clone(), Some(typed));
+            (ctx_for_terminal, run_future)
+        })
+    }
+
+    /// Run the execute interceptor chain synchronously around `build_terminal`, which is
+    /// responsible for producing the final [`WorkflowContext`] and run future from the
+    /// (possibly-mutated) typed args.
+    ///
+    /// All chain machinery shared by the split-init and non-split paths lives here:
+    /// constructing `ExecuteInput`, downcasting back from [`WorkflowValue`] with the
+    /// preserve-type panic message, and recovering the constructed `WorkflowContext` via
+    /// the slot pattern (so signal/query/update dispatch gets the same workflow state the
+    /// terminal handed to `W::run`). If an interceptor short-circuits and never calls
+    /// `next.run`, the slot stays empty and we panic — v1 forbids short-circuiting
+    /// history-producing hooks.
+    fn with_interceptors(
+        base_ctx: BaseWorkflowContext,
+        input: <W::Run as WorkflowDefinition>::Input,
+        build_terminal: impl FnOnce(
+            <W::Run as WorkflowDefinition>::Input,
+        ) -> (WorkflowContext<W>, WorkflowExecuteOutput)
+        + 'static,
+    ) -> Self {
         let input = ExecuteInput::new(
             W::name().to_string(),
-            execute_args,
-            base.initial_headers(),
-            base.workflow_interceptor_context(base.is_replaying()),
+            WorkflowValue::new(input),
+            base_ctx.initial_headers(),
+            base_ctx.workflow_interceptor_context(base_ctx.is_replaying()),
         );
-        let run_ctx = ctx.clone();
-        let run_future = base
+
+        let ctx_slot: Rc<RefCell<Option<WorkflowContext<W>>>> = Rc::new(RefCell::new(None));
+        let ctx_slot_inner = ctx_slot.clone();
+
+        let run_future = base_ctx
             .workflow_interceptors()
-            .execute(input, move |_| {
-                W::run(run_ctx.clone(), run_input) as WorkflowExecuteOutput
+            .execute(input, move |input| {
+                let typed = input
+                    .into_args()
+                    .into_typed::<<W::Run as WorkflowDefinition>::Input>()
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "execute interceptor must preserve workflow input type {}",
+                            std::any::type_name::<<W::Run as WorkflowDefinition>::Input>()
+                        )
+                    });
+                let (ctx, run_future) = build_terminal(typed);
+                *ctx_slot_inner.borrow_mut() = Some(ctx);
+                run_future
             })
             .fuse();
 
+        let ctx = ctx_slot
+            .borrow_mut()
+            .take()
+            .expect("execute interceptor must call next.run() exactly once");
         Self { ctx, run_future }
     }
 }
@@ -588,22 +655,15 @@ impl WorkflowDefinitions {
         let workflow_name = W::name();
         let factory: WorkflowExecutionFactory =
             Arc::new(move |payloads, converter: PayloadConverter, base_ctx| {
-                let execute_args = payloads.clone();
                 let ser_ctx = SerializationContext {
                     data: &SerializationContextData::Workflow,
                     converter: &converter,
                 };
-                let input = converter.from_payloads(&ser_ctx, payloads)?;
-                let (init_input, run_input) = if W::INIT_TAKES_INPUT {
-                    (Some(input), None)
-                } else {
-                    (None, Some(input))
-                };
+                let chain_input = converter.from_payloads(&ser_ctx, payloads)?;
                 Ok(Box::new(WorkflowExecution::<W>::new(
                     base_ctx,
-                    init_input,
-                    run_input,
-                    execute_args,
+                    W::INIT_TAKES_INPUT,
+                    chain_input,
                 )) as Box<dyn DynWorkflowExecution>)
             });
         self.workflows.insert(workflow_name, factory);
@@ -627,7 +687,6 @@ impl WorkflowDefinitions {
         let user_factory = Arc::new(user_factory);
         let factory: WorkflowExecutionFactory =
             Arc::new(move |payloads, converter: PayloadConverter, base_ctx| {
-                let execute_args = payloads.clone();
                 let ser_ctx = SerializationContext {
                     data: &SerializationContextData::Workflow,
                     converter: &converter,
@@ -638,10 +697,7 @@ impl WorkflowDefinitions {
                 // User factory creates the instance - input always goes to run()
                 let workflow = user_factory();
                 Ok(Box::new(WorkflowExecution::<W>::new_with_workflow(
-                    workflow,
-                    base_ctx,
-                    Some(input),
-                    execute_args,
+                    workflow, base_ctx, input,
                 )) as Box<dyn DynWorkflowExecution>)
             });
 
@@ -749,5 +805,150 @@ impl<F: std::future::Future> std::future::Future for JoinAll<F> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         self.0.poll_unpin(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interceptors::{
+        ExecuteInput, Next, WorkflowExecuteOutput, WorkflowInboundInterceptor, WorkflowInterceptor,
+        WorkflowInterceptorContext, WorkflowInterceptorInstance, WorkflowInterceptors,
+    };
+    use std::sync::Mutex;
+    use temporalio_common::protos::coresdk::workflow_activation::InitializeWorkflow;
+    use temporalio_macros::{workflow, workflow_methods};
+    use tokio::sync::watch;
+
+    #[workflow]
+    #[derive(Default)]
+    struct SplitInitWf {
+        seeded: u64,
+    }
+
+    #[workflow_methods]
+    impl SplitInitWf {
+        #[init]
+        fn init(_ctx: &WorkflowContextView, seeded: u64) -> Self {
+            Self { seeded }
+        }
+
+        #[run]
+        async fn run(_ctx: &mut WorkflowContext<Self>) -> crate::WorkflowResult<u64> {
+            unreachable!("test should not poll the run future")
+        }
+    }
+
+    fn make_base_ctx(interceptors: Vec<Arc<dyn WorkflowInterceptor>>) -> BaseWorkflowContext {
+        let init = InitializeWorkflow {
+            workflow_type: SplitInitWf::name().to_string(),
+            ..Default::default()
+        };
+        let (_, cancelled_rx) = watch::channel(None);
+        let (base, _cmd_rx) = BaseWorkflowContext::new(
+            "default".to_string(),
+            "test-task-queue".to_string(),
+            "test-run-id".to_string(),
+            init,
+            cancelled_rx,
+            PayloadConverter::default(),
+        );
+        let interceptor_ctx = base.workflow_interceptor_context(false);
+        base.set_workflow_interceptors(WorkflowInterceptorInstance::new(
+            &interceptors,
+            interceptor_ctx,
+        ));
+        base
+    }
+
+    struct ObservingInterceptor {
+        observed: Arc<Mutex<Option<u64>>>,
+    }
+
+    impl WorkflowInterceptor for ObservingInterceptor {
+        fn intercept_workflow(&self, _ctx: WorkflowInterceptorContext) -> WorkflowInterceptors {
+            WorkflowInterceptors {
+                inbound: Box::new(ObservingInbound {
+                    observed: self.observed.clone(),
+                }),
+                ..Default::default()
+            }
+        }
+    }
+
+    struct ObservingInbound {
+        observed: Arc<Mutex<Option<u64>>>,
+    }
+
+    impl WorkflowInboundInterceptor for ObservingInbound {
+        fn execute<'a>(
+            &'a self,
+            input: ExecuteInput,
+            next: Next<'a, ExecuteInput, WorkflowExecuteOutput>,
+        ) -> WorkflowExecuteOutput {
+            let v = *input
+                .args()
+                .downcast_ref::<u64>()
+                .expect("split-init workflow exposes typed Input");
+            self.observed.lock().unwrap().replace(v);
+            next.run(input)
+        }
+    }
+
+    #[test]
+    fn split_init_runs_init_synchronously_inside_the_chain() {
+        let observed = Arc::new(Mutex::new(None));
+        let base_ctx = make_base_ctx(vec![Arc::new(ObservingInterceptor {
+            observed: observed.clone(),
+        })]);
+
+        let exec = WorkflowExecution::<SplitInitWf>::new(base_ctx, true, 42_u64);
+
+        // The interceptor's `execute` ran synchronously during `WorkflowExecution::new` and
+        // forwarded to `next.run`, which invoked the terminal closure, which called
+        // `W::init`. After `new` returns, the workflow state must reflect what init saw.
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(42),
+            "interceptor must observe the typed args"
+        );
+        assert_eq!(
+            exec.ctx.state(|s| s.seeded),
+            42,
+            "W::init must have run synchronously by the time WorkflowExecution::new returns"
+        );
+    }
+
+    struct ShortCircuitInterceptor;
+
+    impl WorkflowInterceptor for ShortCircuitInterceptor {
+        fn intercept_workflow(&self, _ctx: WorkflowInterceptorContext) -> WorkflowInterceptors {
+            WorkflowInterceptors {
+                inbound: Box::new(ShortCircuitInbound),
+                ..Default::default()
+            }
+        }
+    }
+
+    struct ShortCircuitInbound;
+
+    impl WorkflowInboundInterceptor for ShortCircuitInbound {
+        fn execute<'a>(
+            &'a self,
+            _input: ExecuteInput,
+            _next: Next<'a, ExecuteInput, WorkflowExecuteOutput>,
+        ) -> WorkflowExecuteOutput {
+            // Deliberately drop `_next` without forwarding. v1 forbids this for
+            // history-producing hooks; the SDK panics rather than silently producing a
+            // workflow whose state was never initialized.
+            Box::pin(async { Ok(Payload::default()) })
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "execute interceptor must call next.run() exactly once")]
+    fn split_init_panics_when_interceptor_short_circuits() {
+        let base_ctx = make_base_ctx(vec![Arc::new(ShortCircuitInterceptor)]);
+        let _exec = WorkflowExecution::<SplitInitWf>::new(base_ctx, true, 42_u64);
     }
 }

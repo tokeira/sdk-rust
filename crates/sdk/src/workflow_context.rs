@@ -1176,6 +1176,7 @@ impl<W> WorkflowContext<W> {
         self.sync.view()
     }
 
+    #[cfg(test)]
     pub(crate) fn base(&self) -> BaseWorkflowContext {
         self.sync.base.clone()
     }

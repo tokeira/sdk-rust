@@ -8,19 +8,24 @@ use crate::{
 use anyhow::bail;
 use futures_util::{FutureExt, future::LocalBoxFuture};
 use std::{
+    any::TypeId,
     collections::HashMap,
+    fmt,
     future::Future,
     pin::Pin,
     rc::Rc,
     sync::{Arc, OnceLock},
     task::{Context, Poll},
 };
-use temporalio_common::protos::{
-    coresdk::{
-        workflow_activation::{WorkflowActivation, remove_from_cache::EvictionReason},
-        workflow_completion::WorkflowActivationCompletion,
+use temporalio_common::{
+    data_converters::TemporalSerializable,
+    protos::{
+        coresdk::{
+            workflow_activation::{WorkflowActivation, remove_from_cache::EvictionReason},
+            workflow_completion::WorkflowActivationCompletion,
+        },
+        temporal::api::common::v1::{Payload, Payloads},
     },
-    temporal::api::common::v1::{Payload, Payloads},
 };
 
 /// Implementors can intercept certain actions that happen within the Worker.
@@ -164,6 +169,103 @@ impl<T> CancellableFuture<T> for BoxedCancellableFuture<T> {
     }
 }
 
+/// SDK-owned erased typed value carried through the workflow interceptor chain.
+///
+/// Wraps a concrete `T: TemporalSerializable + 'static` together with `TypeId::of::<T>()` so
+/// interceptors that know the concrete type can read or mutate the value.
+///
+/// For operations that originate as payloads (e.g. signals from history), the wrapped
+/// value can be a `RawValue` so the chain still has a single uniform shape.
+pub struct WorkflowValue {
+    type_id: TypeId,
+    inner: Box<dyn TemporalSerializable>,
+}
+
+impl WorkflowValue {
+    // Intentionally private to prevent end users from `std::mem::swap`ing in differently typed
+    // values in interceptors.
+    pub(crate) fn new<T>(value: T) -> Self
+    where
+        T: TemporalSerializable + 'static,
+    {
+        Self {
+            type_id: TypeId::of::<T>(),
+            inner: Box::new(value),
+        }
+    }
+
+    /// `TypeId` of the wrapped concrete type.
+    pub fn type_id(&self) -> TypeId {
+        self.type_id
+    }
+
+    /// Returns true if the wrapped value's concrete type is `T`.
+    pub fn is<T>(&self) -> bool
+    where
+        T: TemporalSerializable + 'static,
+    {
+        self.type_id == TypeId::of::<T>()
+    }
+
+    /// Borrow the wrapped value as `&T` if its concrete type matches.
+    pub fn downcast_ref<T>(&self) -> Option<&T>
+    where
+        T: TemporalSerializable + 'static,
+    {
+        if self.is::<T>() {
+            // SAFETY: `WorkflowValue` invariant: `type_id` is `TypeId::of::<T>()` for the
+            // concrete type stored in `inner`. Casting `*const dyn TemporalSerializable` to
+            // `*const T` discards the vtable and yields the data pointer to that concrete
+            // value, which is what we return a reference to.
+            let ptr = self.inner.as_ref() as *const dyn TemporalSerializable as *const T;
+            Some(unsafe { &*ptr })
+        } else {
+            None
+        }
+    }
+
+    /// Mutably borrow the wrapped value as `&mut T` if its concrete type matches.
+    ///
+    /// This is the only way for an interceptor to change the carried value — assignment
+    /// through this reference replaces the value in place while preserving the type the SDK
+    /// expects to recover later.
+    pub fn downcast_mut<T>(&mut self) -> Option<&mut T>
+    where
+        T: TemporalSerializable + 'static,
+    {
+        if self.is::<T>() {
+            // SAFETY: see `downcast_ref`. Same invariant; `&mut` is sound because we hold a
+            // unique borrow of `self`.
+            let ptr = self.inner.as_mut() as *mut dyn TemporalSerializable as *mut T;
+            Some(unsafe { &mut *ptr })
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn into_typed<T>(self) -> Result<T, Self>
+    where
+        T: TemporalSerializable + 'static,
+    {
+        if self.is::<T>() {
+            // SAFETY: invariant guarantees `inner` was constructed by us as `Box::new(value)`
+            // for some `T`-typed value, so the layout matches.
+            let raw: *mut dyn TemporalSerializable = Box::into_raw(self.inner);
+            Ok(*unsafe { Box::from_raw(raw as *mut T) })
+        } else {
+            Err(self)
+        }
+    }
+}
+
+impl fmt::Debug for WorkflowValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkflowValue")
+            .field("type_id", &self.type_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Output type for workflow execution interception.
 pub type WorkflowExecuteOutput = LocalBoxFuture<'static, WorkflowResult<Payload>>;
 
@@ -177,6 +279,10 @@ pub type WorkflowQueryOutput = Result<Payload, WorkflowError>;
 pub type SleepOutput = BoxedCancellableFuture<TimerResult>;
 
 /// Continuation for an interceptor operation.
+///
+/// Async behavior is still supported by composing on the *returned* operation output. For
+/// operations whose output is a future, the interceptor can `Box::pin(async move { ... })` over
+/// the future returned by `next.run(input)` to observe completion or transform the result.
 #[must_use = "workflow interceptor continuations must be run to continue the call chain"]
 pub struct Next<'a, I, O> {
     inner: Box<dyn FnOnce(I) -> O + 'a>,
@@ -188,6 +294,10 @@ impl<'a, I, O> Next<'a, I, O> {
     }
 
     /// Continue the call chain with the provided input.
+    ///
+    /// Must be called synchronously inside the interceptor method body. For async-output
+    /// operations, the interceptor should call `run` first to obtain the operation future, then
+    /// return a composed future that wraps it.
     #[must_use = "the returned workflow interceptor output must be used"]
     pub fn run(self, input: I) -> O {
         (self.inner)(input)
@@ -224,11 +334,11 @@ impl WorkflowOperationContext {
 }
 
 /// Input for workflow execution interception.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct ExecuteInput {
     workflow_type: String,
-    args: Vec<Payload>,
+    args: WorkflowValue,
     headers: HashMap<String, Payload>,
     context: WorkflowInterceptorContext,
 }
@@ -236,7 +346,7 @@ pub struct ExecuteInput {
 impl ExecuteInput {
     pub(crate) fn new(
         workflow_type: String,
-        args: Vec<Payload>,
+        args: WorkflowValue,
         headers: HashMap<String, Payload>,
         context: WorkflowInterceptorContext,
     ) -> Self {
@@ -253,9 +363,23 @@ impl ExecuteInput {
         &self.workflow_type
     }
 
-    /// Serialized workflow arguments.
-    pub fn args(&self) -> &[Payload] {
+    /// Workflow arguments as an erased typed value.
+    ///
+    /// The carried concrete type is always the workflow's typed `Input` regardless of
+    /// whether the workflow uses a separate `#[init]` method. Use
+    /// [`WorkflowValue::downcast_ref`] / [`WorkflowValue::downcast_mut`] when the
+    /// interceptor knows that type. Mutating the args in place changes what the workflow
+    /// handler observes — for non-split workflows that's `W::run`, for split-init
+    /// workflows it's `W::init`. The SDK runs the chain at workflow construction time and
+    /// reads the (possibly-mutated) args back out before invoking whichever handler
+    /// consumes them.
+    pub fn args(&self) -> &WorkflowValue {
         &self.args
+    }
+
+    /// Mutable access to the workflow arguments.
+    pub fn args_mut(&mut self) -> &mut WorkflowValue {
+        &mut self.args
     }
 
     /// Workflow headers.
@@ -266,6 +390,10 @@ impl ExecuteInput {
     /// Read-only workflow interceptor context.
     pub fn context(&self) -> &WorkflowInterceptorContext {
         &self.context
+    }
+
+    pub(crate) fn into_args(self) -> WorkflowValue {
+        self.args
     }
 }
 
@@ -450,6 +578,13 @@ impl Default for WorkflowInterceptors {
 }
 
 /// Inbound workflow interceptor hooks.
+///
+/// Methods are synchronous (`fn`, not `async fn`). For operations whose output is a future
+/// (e.g. [`WorkflowExecuteOutput`], [`WorkflowSignalOutput`]), the implementor must call
+/// `next.run(input)` synchronously to obtain the operation future, then return either that
+/// future or a composed future that wraps it. Awaiting before calling `next` would insert a
+/// yield point into the workflow coroutine and break replay determinism, and is structurally
+/// prevented by the [`Next`] type.
 pub trait WorkflowInboundInterceptor: Send + Sync + 'static {
     /// Intercept workflow execution.
     fn execute<'a>(
@@ -480,6 +615,13 @@ pub trait WorkflowInboundInterceptor: Send + Sync + 'static {
 }
 
 /// Outbound workflow interceptor hooks.
+///
+/// Methods are synchronous (`fn`, not `async fn`). The output type for each hook matches the
+/// SDK operation it wraps: synchronous operations return values directly, asynchronous
+/// operations return futures (typically [`BoxedCancellableFuture`] or `LocalBoxFuture`).
+/// Implementors must call `next.run(input)` synchronously before returning; async observation
+/// of operation completion is done by wrapping the returned future. The same replay-determinism
+/// rationale as [`WorkflowInboundInterceptor`] applies.
 pub trait WorkflowOutboundInterceptor: Send + Sync + 'static {
     /// Intercept workflow timer creation.
     fn sleep<'a>(
@@ -559,62 +701,50 @@ impl WorkflowInterceptorInstance {
     }
 }
 
-fn call_execute<'a>(
-    interceptors: &'a [Rc<dyn WorkflowInboundInterceptor>],
-    input: ExecuteInput,
-    next: Next<'a, ExecuteInput, WorkflowExecuteOutput>,
-) -> WorkflowExecuteOutput {
-    if let Some((first, rest)) = interceptors.split_first() {
-        first.execute(
-            input,
-            Next::new(move |input| call_execute(rest, input, next)),
-        )
-    } else {
-        next.run(input)
-    }
+macro_rules! workflow_interceptor_call {
+    ($call_fn:ident, $interceptor_trait:ident, $method:ident, $input:ty, $output:ty) => {
+        fn $call_fn<'a>(
+            interceptors: &'a [Rc<dyn $interceptor_trait>],
+            input: $input,
+            next: Next<'a, $input, $output>,
+        ) -> $output {
+            if let Some((first, rest)) = interceptors.split_first() {
+                first.$method(input, Next::new(move |input| $call_fn(rest, input, next)))
+            } else {
+                next.run(input)
+            }
+        }
+    };
 }
 
-fn call_handle_signal<'a>(
-    interceptors: &'a [Rc<dyn WorkflowInboundInterceptor>],
-    input: HandleSignalInput,
-    next: Next<'a, HandleSignalInput, WorkflowSignalOutput>,
-) -> WorkflowSignalOutput {
-    if let Some((first, rest)) = interceptors.split_first() {
-        first.handle_signal(
-            input,
-            Next::new(move |input| call_handle_signal(rest, input, next)),
-        )
-    } else {
-        next.run(input)
-    }
-}
-
-fn call_handle_query<'a>(
-    interceptors: &'a [Rc<dyn WorkflowInboundInterceptor>],
-    input: HandleQueryInput,
-    next: Next<'a, HandleQueryInput, WorkflowQueryOutput>,
-) -> WorkflowQueryOutput {
-    if let Some((first, rest)) = interceptors.split_first() {
-        first.handle_query(
-            input,
-            Next::new(move |input| call_handle_query(rest, input, next)),
-        )
-    } else {
-        next.run(input)
-    }
-}
-
-fn call_sleep<'a>(
-    interceptors: &'a [Rc<dyn WorkflowOutboundInterceptor>],
-    input: SleepInput,
-    next: Next<'a, SleepInput, SleepOutput>,
-) -> SleepOutput {
-    if let Some((first, rest)) = interceptors.split_first() {
-        first.sleep(input, Next::new(move |input| call_sleep(rest, input, next)))
-    } else {
-        next.run(input)
-    }
-}
+workflow_interceptor_call!(
+    call_execute,
+    WorkflowInboundInterceptor,
+    execute,
+    ExecuteInput,
+    WorkflowExecuteOutput
+);
+workflow_interceptor_call!(
+    call_handle_signal,
+    WorkflowInboundInterceptor,
+    handle_signal,
+    HandleSignalInput,
+    WorkflowSignalOutput
+);
+workflow_interceptor_call!(
+    call_handle_query,
+    WorkflowInboundInterceptor,
+    handle_query,
+    HandleQueryInput,
+    WorkflowQueryOutput
+);
+workflow_interceptor_call!(
+    call_sleep,
+    WorkflowOutboundInterceptor,
+    sleep,
+    SleepInput,
+    SleepOutput
+);
 
 #[cfg(test)]
 mod tests {
@@ -805,5 +935,131 @@ mod tests {
             *observed_duration.lock().unwrap(),
             Some(Duration::from_secs(3))
         );
+    }
+
+    struct SignalWrappingWorkflowInterceptor {
+        observed: Arc<Mutex<Option<&'static str>>>,
+    }
+
+    impl WorkflowInterceptor for SignalWrappingWorkflowInterceptor {
+        fn intercept_workflow(&self, _ctx: WorkflowInterceptorContext) -> WorkflowInterceptors {
+            WorkflowInterceptors {
+                inbound: Box::new(SignalWrappingInbound {
+                    observed: self.observed.clone(),
+                }),
+                outbound: Box::new(NoopWorkflowOutboundInterceptor),
+            }
+        }
+    }
+
+    struct SignalWrappingInbound {
+        observed: Arc<Mutex<Option<&'static str>>>,
+    }
+
+    impl WorkflowInboundInterceptor for SignalWrappingInbound {
+        fn handle_signal<'a>(
+            &'a self,
+            input: HandleSignalInput,
+            next: Next<'a, HandleSignalInput, WorkflowSignalOutput>,
+        ) -> WorkflowSignalOutput {
+            let inner = next.run(input);
+            let observed = self.observed.clone();
+            Box::pin(async move {
+                let result = inner.await;
+                observed
+                    .lock()
+                    .unwrap()
+                    .replace(if result.is_ok() { "ok" } else { "err" });
+                result
+            })
+        }
+    }
+
+    #[test]
+    fn inbound_signal_interceptor_can_wrap_output_future() {
+        let observed = Arc::new(Mutex::new(None));
+        let interceptors: Vec<Arc<dyn WorkflowInterceptor>> =
+            vec![Arc::new(SignalWrappingWorkflowInterceptor {
+                observed: observed.clone(),
+            })];
+        let instance = WorkflowInterceptorInstance::new(&interceptors, test_context());
+        let input =
+            HandleSignalInput::new("sig".to_string(), vec![], HashMap::new(), test_context());
+
+        let fut = instance.handle_signal(input, |_| Box::pin(async { Ok(()) }));
+
+        assert!(observed.lock().unwrap().is_none());
+        let result = futures::executor::block_on(fut);
+        assert!(result.is_ok());
+        assert_eq!(*observed.lock().unwrap(), Some("ok"));
+    }
+
+    #[test]
+    fn workflow_value_downcast_ref_and_mut() {
+        let mut value = WorkflowValue::new(42_i32);
+        assert!(value.is::<i32>());
+        assert!(!value.is::<String>());
+        assert_eq!(value.downcast_ref::<i32>(), Some(&42));
+        assert!(value.downcast_ref::<String>().is_none());
+
+        *value.downcast_mut::<i32>().unwrap() = 7;
+        assert_eq!(value.downcast_ref::<i32>(), Some(&7));
+    }
+
+    struct ArgsMutatingExecuteInterceptor {
+        replacement: i32,
+    }
+
+    impl WorkflowInterceptor for ArgsMutatingExecuteInterceptor {
+        fn intercept_workflow(&self, _ctx: WorkflowInterceptorContext) -> WorkflowInterceptors {
+            WorkflowInterceptors {
+                inbound: Box::new(ArgsMutatingExecuteInbound {
+                    replacement: self.replacement,
+                }),
+                outbound: Box::new(NoopWorkflowOutboundInterceptor),
+            }
+        }
+    }
+
+    struct ArgsMutatingExecuteInbound {
+        replacement: i32,
+    }
+
+    impl WorkflowInboundInterceptor for ArgsMutatingExecuteInbound {
+        fn execute<'a>(
+            &'a self,
+            mut input: ExecuteInput,
+            next: Next<'a, ExecuteInput, WorkflowExecuteOutput>,
+        ) -> WorkflowExecuteOutput {
+            *input
+                .args_mut()
+                .downcast_mut::<i32>()
+                .expect("execute input should carry the workflow's typed input") = self.replacement;
+            next.run(input)
+        }
+    }
+
+    #[test]
+    fn execute_interceptor_arg_mutation_flows_to_handler() {
+        let observed = Arc::new(Mutex::new(None));
+        let observed_for_next = observed.clone();
+        let interceptors: Vec<Arc<dyn WorkflowInterceptor>> =
+            vec![Arc::new(ArgsMutatingExecuteInterceptor { replacement: 99 })];
+        let instance = WorkflowInterceptorInstance::new(&interceptors, test_context());
+
+        let input = ExecuteInput::new(
+            "TestWorkflow".to_string(),
+            WorkflowValue::new(1_i32),
+            HashMap::new(),
+            test_context(),
+        );
+
+        let _ = instance.execute(input, move |input| {
+            let typed = input.into_args().into_typed::<i32>().unwrap();
+            observed_for_next.lock().unwrap().replace(typed);
+            Box::pin(async { Ok(Payload::default()) })
+        });
+
+        assert_eq!(*observed.lock().unwrap(), Some(99));
     }
 }
