@@ -89,7 +89,7 @@ pub mod coresdk {
             fn from(v: workflow_command::Variant) -> Self {
                 Self {
                     variant: Some(v),
-                    user_metadata: None,
+                    ..Default::default()
                 }
             }
         }
@@ -1309,6 +1309,7 @@ pub mod coresdk {
                         input: Vec::from_payloads(a.input),
                         identity: a.identity,
                         headers: a.header.map(Into::into).unwrap_or_default(),
+                        originating_event_id: 0,
                     }
                 }
             }
@@ -1325,6 +1326,7 @@ pub mod coresdk {
                 workflow_id: String,
                 randomness_seed: u64,
                 start_time: Timestamp,
+                originating_event_id: i64,
             ) -> InitializeWorkflow {
                 InitializeWorkflow {
                     workflow_type: attrs.workflow_type.map(|wt| wt.name).unwrap_or_default(),
@@ -1358,6 +1360,7 @@ pub mod coresdk {
                     start_time: Some(start_time),
                     root_workflow: attrs.root_workflow_execution,
                     priority: attrs.priority,
+                    originating_event_id,
                 }
             }
         }
@@ -1710,35 +1713,35 @@ pub mod temporal {
                                 a @ Attributes::StartTimerCommandAttributes(_) => Self {
                                     command_type: CommandType::StartTimer as i32,
                                     attributes: Some(a),
-                                    user_metadata: Default::default(),
+                                    ..Default::default()
                                 },
                                 a @ Attributes::CancelTimerCommandAttributes(_) => Self {
                                     command_type: CommandType::CancelTimer as i32,
                                     attributes: Some(a),
-                                    user_metadata: Default::default(),
+                                    ..Default::default()
                                 },
                                 a @ Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
                                     Self {
                                         command_type: CommandType::CompleteWorkflowExecution as i32,
                                         attributes: Some(a),
-                                        user_metadata: Default::default(),
+                                        ..Default::default()
                                     }
                                 }
                                 a @ Attributes::FailWorkflowExecutionCommandAttributes(_) => Self {
                                     command_type: CommandType::FailWorkflowExecution as i32,
                                     attributes: Some(a),
-                                    user_metadata: Default::default(),
+                                    ..Default::default()
                                 },
                                 a @ Attributes::ScheduleActivityTaskCommandAttributes(_) => Self {
                                     command_type: CommandType::ScheduleActivityTask as i32,
                                     attributes: Some(a),
-                                    user_metadata: Default::default(),
+                                    ..Default::default()
                                 },
                                 a @ Attributes::RequestCancelActivityTaskCommandAttributes(_) => {
                                     Self {
                                         command_type: CommandType::RequestCancelActivityTask as i32,
                                         attributes: Some(a),
-                                        user_metadata: Default::default(),
+                                        ..Default::default()
                                     }
                                 }
                                 a
@@ -1748,31 +1751,31 @@ pub mod temporal {
                                     command_type: CommandType::ContinueAsNewWorkflowExecution
                                         as i32,
                                     attributes: Some(a),
-                                    user_metadata: Default::default(),
+                                    ..Default::default()
                                 },
                                 a @ Attributes::CancelWorkflowExecutionCommandAttributes(_) => {
                                     Self {
                                         command_type: CommandType::CancelWorkflowExecution as i32,
                                         attributes: Some(a),
-                                        user_metadata: Default::default(),
+                                        ..Default::default()
                                     }
                                 }
                                 a @ Attributes::RecordMarkerCommandAttributes(_) => Self {
                                     command_type: CommandType::RecordMarker as i32,
                                     attributes: Some(a),
-                                    user_metadata: Default::default(),
+                                    ..Default::default()
                                 },
                                 a @ Attributes::ProtocolMessageCommandAttributes(_) => Self {
                                     command_type: CommandType::ProtocolMessage as i32,
                                     attributes: Some(a),
-                                    user_metadata: Default::default(),
+                                    ..Default::default()
                                 },
                                 a @ Attributes::RequestCancelNexusOperationCommandAttributes(_) => {
                                     Self {
                                         command_type: CommandType::RequestCancelNexusOperation
                                             as i32,
                                         attributes: Some(a),
-                                        user_metadata: Default::default(),
+                                        ..Default::default()
                                     }
                                 }
                                 _ => unimplemented!(),

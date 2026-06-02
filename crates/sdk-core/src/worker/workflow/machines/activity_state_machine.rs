@@ -799,7 +799,7 @@ where
                 },
             ),
         ),
-        user_metadata: Default::default(),
+        ..Default::default()
     };
     ActivityMachineTransition::ok(
         vec![ActivityMachineCommand::RequestCancellation(cmd)],

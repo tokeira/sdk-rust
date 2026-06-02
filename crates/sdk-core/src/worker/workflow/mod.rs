@@ -81,7 +81,7 @@ use temporalio_common::{
             failure::v1::{ApplicationFailureInfo, failure::FailureInfo},
             protocol::v1::Message as ProtocolMessage,
             query::v1::WorkflowQuery,
-            sdk::v1::{UserMetadata, WorkflowTaskCompletedMetadata},
+            sdk::v1::{EventGroupMarker, UserMetadata, WorkflowTaskCompletedMetadata},
             taskqueue::v1::StickyExecutionAttributes,
             workflowservice::v1::{PollActivityTaskQueueResponse, get_system_info_response},
         },
@@ -1345,6 +1345,7 @@ struct EmptyWorkflowCommandErr;
 struct WFCommand {
     variant: WFCommandVariant,
     metadata: Option<UserMetadata>,
+    event_group_markers: Vec<EventGroupMarker>,
 }
 
 #[derive(Debug, derive_more::From, derive_more::Display)]
@@ -1439,6 +1440,7 @@ impl TryFrom<WorkflowCommand> for WFCommand {
         Ok(Self {
             variant,
             metadata: c.user_metadata,
+            event_group_markers: c.event_group_markers,
         })
     }
 }
