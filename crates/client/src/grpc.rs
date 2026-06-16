@@ -15,6 +15,7 @@ use dyn_clone::DynClone;
 use futures_util::{FutureExt, TryFutureExt, future::BoxFuture};
 use std::{any::Any, marker::PhantomData, sync::Arc};
 use temporalio_common::{
+    payload_limits::{PayloadLimits, validate_known_payload_limits},
     protos::{
         grpc::health::v1::{health_client::HealthClient, *},
         temporal::api::{
@@ -144,6 +145,13 @@ impl RawGrpcCaller for Connection {
         F: FnMut(Request<Req>) -> BoxFuture<'static, Result<Response<Resp>, Status>>,
         F: Send + Sync + Unpin + 'static,
     {
+        // Validate payload sizes after any request mutation but before encoding/metrics.
+        validate_request_payload_limits(
+            &req,
+            self.inner.payload_size_warn,
+            self.inner.memo_size_warn,
+        )?;
+
         let info = self
             .inner
             .retry_options
@@ -180,6 +188,48 @@ fn req_cloner<T: Clone>(cloneme: &Request<T>) -> Request<T> {
     }
     *new_req.extensions_mut() = cloneme.extensions().clone();
     new_req
+}
+
+/// Per-call payload/memo size error limits, attached to a request's extensions by a caller that
+/// wants error-level enforcement on this call.
+#[derive(Debug, Clone, Copy)]
+pub struct PayloadErrorLimits {
+    /// Blob (payload) size error threshold, in bytes.
+    pub blob: usize,
+    /// Memo size error threshold, in bytes.
+    pub memo: usize,
+}
+
+/// `*_warn` are the connection's configured warn thresholds; per-call error limits ride a
+/// [`PayloadErrorLimits`] extension. On an error-level violation, returns a [`Status`] carrying
+/// the [`PayloadLimitViolation`] as its source (extract via [crate::payload_limit_violation_from]).
+fn validate_request_payload_limits<Req: Any>(
+    req: &Request<Req>,
+    blob_warn: usize,
+    memo_warn: usize,
+) -> Result<(), Status> {
+    let mut limits = PayloadLimits {
+        blob_warn,
+        memo_warn,
+        blob_error: None,
+        memo_error: None,
+    };
+    if let Some(error_limits) = req.extensions().get::<PayloadErrorLimits>() {
+        // A zero threshold means "no limit for this class" (how the server reports an unset limit).
+        if error_limits.blob > 0 {
+            limits.blob_error = Some(error_limits.blob);
+        }
+        if error_limits.memo > 0 {
+            limits.memo_error = Some(error_limits.memo);
+        }
+    }
+    if let Some(violation) = validate_known_payload_limits(req.get_ref(), &limits) {
+        let mut status =
+            Status::invalid_argument(format!("Payload size limit exceeded: {violation}"));
+        status.set_source(Arc::new(violation));
+        return Err(status);
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -1879,6 +1929,49 @@ mod tests {
     use tonic::IntoRequest;
     use url::Url;
     use uuid::Uuid;
+
+    #[test]
+    fn payload_limits_warn_only_vs_error() {
+        use temporalio_common::protos::temporal::api::{
+            common::v1::{Payload, Payloads},
+            workflowservice::v1::StartWorkflowExecutionRequest,
+        };
+        let big = Payloads {
+            payloads: vec![Payload {
+                data: vec![0u8; 1000],
+                ..Default::default()
+            }],
+        };
+        let new_req = || {
+            StartWorkflowExecutionRequest {
+                input: Some(big.clone()),
+                ..Default::default()
+            }
+            .into_request()
+        };
+
+        // warn thresholds = 1 byte. No per-call error limits: over-warn is allowed (warn-only).
+        assert!(validate_request_payload_limits(&new_req(), 1, 1).is_ok());
+
+        // With per-call error limits below the payload size: rejected, carrying the typed violation.
+        let mut req = new_req();
+        req.extensions_mut()
+            .insert(PayloadErrorLimits { blob: 10, memo: 10 });
+        let err = validate_request_payload_limits(&req, 1, 1).unwrap_err();
+        let violation = crate::payload_limit_violation_from(&err).expect("violation carried on status");
+        assert_eq!(violation.path, "input");
+        assert_eq!(
+            violation.class,
+            temporalio_common::payload_limits::LimitClass::Blob
+        );
+        assert!(violation.size > violation.limit);
+
+        // A zero error threshold means "no limit" for that class, so it does not reject.
+        let mut req = new_req();
+        req.extensions_mut()
+            .insert(PayloadErrorLimits { blob: 0, memo: 0 });
+        assert!(validate_request_payload_limits(&req, 1, 1).is_ok());
+    }
 
     // Just to help make sure some stuff compiles. Not run.
     #[allow(dead_code)]

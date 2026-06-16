@@ -58,8 +58,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use temporalio_client::MESSAGE_TOO_LARGE_KEY;
+use temporalio_client::{MESSAGE_TOO_LARGE_KEY, payload_limit_violation_from};
 use temporalio_common::{
+    payload_limits::PayloadLimitViolation,
     protos::{
         TaskToken,
         coresdk::{
@@ -424,6 +425,26 @@ impl Workflows {
                             run_metrics
                                 .with_new_attrs([metrics::failure_reason(
                                     FailureReason::GrpcMessageTooLarge,
+                                )])
+                                .wf_task_failed();
+                            return Err(e);
+                        }
+                        // Client layer rejected the completion for exceeding the worker's payload
+                        // error limit; proactively fail the WFT instead.
+                        Err(e) if payload_limit_violation_from(&e).is_some() => {
+                            let violation =
+                                payload_limit_violation_from(&e).expect("violation present per guard");
+                            let failure = make_payloads_too_large_failure(violation);
+                            let new_outcome = FailedActivationWFTReport::Report(
+                                task_token,
+                                WorkflowTaskFailedCause::PayloadsTooLarge,
+                                failure,
+                            );
+                            self.handle_activation_failed(run_id, completion_time, new_outcome)
+                                .await;
+                            run_metrics
+                                .with_new_attrs([metrics::failure_reason(
+                                    FailureReason::PayloadsTooLarge,
                                 )])
                                 .wf_task_failed();
                             return Err(e);
@@ -1722,6 +1743,25 @@ fn make_grpc_message_too_large_failure() -> Failure {
             },
         ),
         force_cause: WorkflowTaskFailedCause::GrpcMessageTooLarge as i32,
+    }
+}
+
+fn make_payloads_too_large_failure(violation: &PayloadLimitViolation) -> Failure {
+    Failure {
+        failure: Some(
+            temporalio_common::protos::temporal::api::failure::v1::Failure {
+                message: format!("Payload size limit exceeded: {violation}"),
+                failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                    ApplicationFailureInfo {
+                        r#type: "PayloadsTooLarge".to_string(),
+                        non_retryable: true,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
+        ),
+        force_cause: WorkflowTaskFailedCause::PayloadsTooLarge as i32,
     }
 }
 

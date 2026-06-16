@@ -5,7 +5,7 @@ use crate::{
     protosext::legacy_query_failure,
     worker::{WorkerVersioningStrategy, worker_control_task_queue},
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use prost_types::Duration as PbDuration;
 use std::{
     collections::HashMap,
@@ -13,7 +13,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_client::{
-    Connection, Namespace, NamespacedClient, RetryOptions, SharedReplaceableClient,
+    Connection, Namespace, NamespacedClient, PayloadErrorLimits, RetryOptions,
+    SharedReplaceableClient,
     grpc::WorkflowService,
     request_extensions::{IsWorkerTaskLongPoll, NoRetryOnMatching, RetryConfigForCall},
     worker::ClientWorkerSet,
@@ -62,6 +63,8 @@ pub(crate) struct WorkerClientBag {
     worker_versioning_strategy: WorkerVersioningStrategy,
     worker_instance_key: Uuid,
     worker_heartbeat_map: Arc<Mutex<HashMap<String, ClientHeartbeatData>>>,
+    /// Payload/memo size error limits attached to outbound completions so the gRPC layer enforces them.
+    payload_error_limits: RwLock<Option<PayloadErrorLimits>>,
 }
 
 impl WorkerClientBag {
@@ -77,7 +80,16 @@ impl WorkerClientBag {
             worker_versioning_strategy,
             worker_instance_key,
             worker_heartbeat_map: Arc::new(Mutex::new(HashMap::new())),
+            payload_error_limits: RwLock::new(None),
         }
+    }
+
+    /// Attach the worker's error limits (if any) to a completion request, for the gRPC layer to read.
+    fn with_payload_error_limits<T>(&self, mut request: tonic::Request<T>) -> tonic::Request<T> {
+        if let Some(limits) = *self.payload_error_limits.read() {
+            request.extensions_mut().insert(limits);
+        }
+        request
     }
 
     fn identity(&self) -> String {
@@ -267,6 +279,8 @@ pub trait WorkerClient: Sync + Send {
     /// Sets the client-reliant fields for WorkerHeartbeat. This also updates client-level tracking
     /// of heartbeat fields, like last heartbeat timestamp.
     fn set_heartbeat_client_fields(&self, heartbeat: &mut WorkerHeartbeat);
+    /// Set the worker's payload/memo error limits
+    fn set_payload_error_limits(&self, _limits: Option<PayloadErrorLimits>) {}
 }
 
 /// Configuration options shared by workflow, activity, and Nexus polling calls
@@ -481,7 +495,7 @@ impl WorkerClient for WorkerClientBag {
         Ok(self
             .connection
             .clone()
-            .respond_workflow_task_completed(request.into_request())
+            .respond_workflow_task_completed(self.with_payload_error_limits(request.into_request()))
             .await?
             .into_inner())
     }
@@ -495,19 +509,21 @@ impl WorkerClient for WorkerClientBag {
             .connection
             .clone()
             .respond_activity_task_completed(
-                #[allow(deprecated)] // want to list all fields explicitly
-                RespondActivityTaskCompletedRequest {
-                    task_token: task_token.0,
-                    result,
-                    identity: self.identity(),
-                    namespace: self.namespace.clone(),
-                    worker_version: self.worker_version_stamp(),
-                    // Will never be set, deprecated.
-                    deployment: None,
-                    deployment_options: self.deployment_options(),
-                    resource_id: Default::default(),
-                }
-                .into_request(),
+                self.with_payload_error_limits(
+                    #[allow(deprecated)] // want to list all fields explicitly
+                    RespondActivityTaskCompletedRequest {
+                        task_token: task_token.0,
+                        result,
+                        identity: self.identity(),
+                        namespace: self.namespace.clone(),
+                        worker_version: self.worker_version_stamp(),
+                        // Will never be set, deprecated.
+                        deployment: None,
+                        deployment_options: self.deployment_options(),
+                        resource_id: Default::default(),
+                    }
+                    .into_request(),
+                ),
             )
             .await?
             .into_inner())
@@ -593,21 +609,23 @@ impl WorkerClient for WorkerClientBag {
             .connection
             .clone()
             .respond_activity_task_failed(
-                #[allow(deprecated)] // want to list all fields explicitly
-                RespondActivityTaskFailedRequest {
-                    task_token: task_token.0,
-                    failure,
-                    identity: self.identity(),
-                    namespace: self.namespace.clone(),
-                    // TODO: Implement - https://github.com/temporalio/sdk-core/issues/293
-                    last_heartbeat_details: None,
-                    worker_version: self.worker_version_stamp(),
-                    // Will never be set, deprecated.
-                    deployment: None,
-                    deployment_options: self.deployment_options(),
-                    resource_id: Default::default(),
-                }
-                .into_request(),
+                self.with_payload_error_limits(
+                    #[allow(deprecated)] // want to list all fields explicitly
+                    RespondActivityTaskFailedRequest {
+                        task_token: task_token.0,
+                        failure,
+                        identity: self.identity(),
+                        namespace: self.namespace.clone(),
+                        // TODO: Implement - https://github.com/temporalio/sdk-core/issues/293
+                        last_heartbeat_details: None,
+                        worker_version: self.worker_version_stamp(),
+                        // Will never be set, deprecated.
+                        deployment: None,
+                        deployment_options: self.deployment_options(),
+                        resource_id: Default::default(),
+                    }
+                    .into_request(),
+                ),
             )
             .await?
             .into_inner())
@@ -880,6 +898,10 @@ impl WorkerClient for WorkerClientBag {
             &mut heartbeat.local_activity_slots_info,
             &mut client_heartbeat_data.local_activity_slots_info,
         );
+    }
+
+    fn set_payload_error_limits(&self, limits: Option<PayloadErrorLimits>) {
+        *self.payload_error_limits.write() = limits;
     }
 }
 

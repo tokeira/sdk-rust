@@ -84,6 +84,14 @@ pub struct ConnectionOptions {
     /// If service_override is specified, is forced to `None`.
     #[builder(default)]
     pub grpc_compression: GrpcCompression,
+    /// Warning threshold (bytes) for outbound payload sizes; over-threshold payloads are
+    /// logged but still sent to server. Defaults to 512 KiB.
+    #[builder(default = temporalio_common::payload_limits::DEFAULT_BLOB_SIZE_WARN)]
+    pub payload_size_warn: usize,
+    /// Warning threshold (bytes) for outbound memo sizes; over-threshold memos are
+    /// logged but still sent to server. Defaults to 2 KiB.
+    #[builder(default = temporalio_common::payload_limits::DEFAULT_MEMO_SIZE_WARN)]
+    pub memo_size_warn: usize,
 
     // Internal / Core-based SDK only options below =============================================
     /// If set true, get_system_info will not be called upon connection.

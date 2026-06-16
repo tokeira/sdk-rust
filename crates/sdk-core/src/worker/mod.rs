@@ -6,7 +6,7 @@ mod slot_provider;
 pub(crate) mod tuner;
 mod workflow;
 
-use temporalio_client::Connection;
+use temporalio_client::{Connection, PayloadErrorLimits};
 use temporalio_common::{
     protos::{
         coresdk::{
@@ -273,6 +273,12 @@ pub struct WorkerConfig {
     /// List of storage drivers used by lang.
     #[builder(default)]
     pub storage_drivers: HashSet<StorageDriverInfo>,
+
+    /// If set, the worker won't enforce server payload/memo error limits on outbound completions —
+    /// oversized payloads are still warned about, and the server still rejects them. When unset, an
+    /// oversized completion is proactively failed as a WFT/activity rather than sent.
+    #[builder(default = false)]
+    pub disable_payload_error_limit: bool,
 }
 
 impl WorkerConfig {
@@ -531,6 +537,17 @@ impl Worker {
                         memo_size_limit_error: api_limits.memo_size_limit_error,
                     })
                 });
+                // Install the namespace error limits on the client (enforced on completions) unless
+                // opted out; warn-level enforcement is always on, configured on the connection.
+                if !self.config.disable_payload_error_limit
+                    && let Some(limits) = limits.as_ref()
+                {
+                    self.client
+                        .set_payload_error_limits(Some(PayloadErrorLimits {
+                            blob: limits.blob_size_limit_error.max(0) as usize,
+                            memo: limits.memo_size_limit_error.max(0) as usize,
+                        }));
+                }
                 if let Some(caps) = ns_info.and_then(|ns| ns.capabilities) {
                     if caps.worker_poll_complete_on_shutdown {
                         self.capabilities
