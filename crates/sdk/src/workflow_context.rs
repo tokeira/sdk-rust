@@ -10,7 +10,8 @@ use crate::{
     CancelExternalWfResult, CancellableID, CancellableIDWithReason, CommandCreateRequest,
     CommandSubscribeChildWorkflowCompletion, NexusStartResult, RustWfCmd, SignalExternalWfResult,
     SupportsCancelReason, TimerResult, UnblockEvent, Unblockable, WorkflowTermination,
-    workflow_context::options::IntoWorkflowCommand, workflow_executor::SdkWakeGuard,
+    workflow_context::options::IntoWorkflowCommand,
+    workflow_executor::{SdkGuardedFuture, SdkWakeGuard},
 };
 use futures_util::{
     FutureExt,
@@ -2137,7 +2138,10 @@ pub(crate) struct NexusUnblockData {
 
 impl StartedNexusOperation {
     pub async fn result(&self) -> NexusOperationResult {
-        self.unblock_dat.result_future.clone().await
+        // Wrap the shared result future's poll in an `SdkWakeGuard` (via `SdkGuardedFuture`) so the
+        // `Shared` future's internal waker machinery isn't flagged as a non-SDK wake on replay
+        // (TMPRL1100). Mirrors the `join_all`/`FuturesOrdered` handling in `workflows.rs`.
+        SdkGuardedFuture(self.unblock_dat.result_future.clone()).await
     }
 
     pub fn cancel(&self) {
