@@ -48,6 +48,11 @@ relevant information.
   are preserved on failure; workers warn when the server does not advertise support.
 
 ### Fixed
+* Worker shutdown now drains activity completions that are still flushing their result to the
+  server before finishing. Previously such a completion — typically one whose final heartbeat RPC
+  was still in flight — could be permanently stranded by shutdown: the activity's result was
+  never reported (the server had to time the attempt out before retrying it), and workers missed
+  shutdown's slot-permit release deadline, panicking in debug builds.
 * Workers no longer send worker heartbeats or appear in centralized heartbeat reports before they
   begin polling.
 * Ephemeral server processes no longer leak on failed start.
